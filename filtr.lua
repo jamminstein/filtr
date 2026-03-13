@@ -198,7 +198,7 @@ local transforms = {
     },
     process = function(msg, p)
       if msg.type == "note_on" then
-        local jitter = math.random(-p[1].val, p[1].val)
+        local jitter = math.floor((math.random() * 2 - 1) * p[1].val)
         msg.vel = clamp(msg.vel + jitter, 1, 127)
       end
       return {msg}
@@ -333,7 +333,7 @@ local transforms = {
           local chord = self._chord
           self._chord = {}
           table.sort(chord, function(a,b)
-            return p[2].val==1 and a.note < b.note or a.note > b.note
+            if p[2].val == 1 then return a.note < b.note else return a.note > b.note end
           end)
           for i, n in ipairs(chord) do
             clock.run(function()
@@ -374,7 +374,7 @@ local transforms = {
     process = function(msg, p)
       if msg.type == "note_on" or msg.type == "note_off" then
         if math.random(100) <= p[2].val then
-          local shift = math.random(-p[1].val, p[1].val) * 12
+          local shift = math.floor((math.random() * 2 - 1) * p[1].val) * 12
           msg.note = clamp_note(msg.note + shift)
         end
       end
@@ -859,5 +859,13 @@ function init()
 end
 
 function cleanup()
-  -- norns handles MIDI and grid disconnection automatically
+  clock.cancel_all()
+  if g then g:all(0); g:refresh() end
+  if midi_in then midi_in.event = nil end
+  if midi_out then
+    for ch = 1, 16 do
+      midi_out:cc(123, 0, ch)
+      midi_out:cc(120, 0, ch)
+    end
+  end
 end
