@@ -719,6 +719,10 @@ end
 -- CLEANUP (K1+K3)
 -- ────────────────────────────────────────
 
+function redraw()
+  screen_redraw()
+end
+
 function cleanup()
   for i=1, #chain do
     local t = transforms[chain[i]]
