@@ -1,6 +1,7 @@
 -- filtr
 -- midi transformation engine
 -- norns + grid
+-- + internal PolyPerc engine for standalone playback
 --
 -- ENC1: select transform / navigate chain
 -- ENC2: select parameter
@@ -22,26 +23,30 @@
 --   K2: add transform to chain (at current slot)
 --   K3: remove transform from current chain slot
 
-engine.name = "None"
+engine.name = "PolyPerc"
 
 local midi_in  = nil
 local midi_out = nil
 local g        = nil  -- grid
 
--- ──────────────────────────────────────────────
+local function midi_to_hz(note)
+  return 440 * 2^((note - 69) / 12)
+end
+
+-- ────────────────────────────────────────
 -- SCREEN STATE (NEW)
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 local beat_phase = 0
 local popup_param = nil
 local popup_val = nil
 local popup_time = 0
 local midi_activity_time = 0
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- TRANSFORM DEFINITIONS
 -- each transform has:
 --   name, active, params[], process(msg, state)
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local SCALES = {
   { name="chromatic",  intervals={0,1,2,3,4,5,6,7,8,9,10,11} },
@@ -73,19 +78,19 @@ end
 local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
 local function clamp_note(n) return clamp(n, 0, 127) end
 
--- ── note delay buffer ──────────────────────────
+-- ── note delay buffer ───────────────────
 local delay_buffer = {}  -- {note, ch, vel, time}
 local held_notes   = {}  -- track for note-off delay
 
--- ── chord detection ───────────────────────────
+-- ── chord detection ─────────────────────
 local chord_notes = {}   -- notes currently held, sorted
 
--- ── strum state ──────────────────────────────
+-- ── strum state ────────────────────────
 local strum_jobs = {}
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- TRANSFORMS TABLE
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local transforms = {
 
@@ -482,9 +487,9 @@ local transforms = {
 
 }
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- TRANSFORM CHAIN
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local chain = {}  -- ordered list of transform indices
 local max_chain_slots = 4  -- limited to 4 as per spec
@@ -492,9 +497,9 @@ local chain_mode = false
 local chain_selected_slot = 1
 local chain_probs = {}  -- probability (0-100) for each chain slot
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- STATE
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local state = {
   selected_transform = 1,
@@ -505,11 +510,18 @@ local state = {
   output_channel     = 0,   -- 0 = same as input, 1-16 = fixed
 }
 
--- ──────────────────────────────────────────────
--- MIDI SEND
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
+-- MIDI SEND (with engine + MIDI output)
+-- ────────────────────────────────────────
 
 function send_midi(msg)
+  -- Engine output (PolyPerc: single notes via hz())
+  if msg.type == "note_on" then
+    local freq = midi_to_hz(msg.note)
+    engine.hz(freq)
+  end
+  
+  -- MIDI output
   if not midi_out then return end
   if msg.type == "note_on" then
     midi_out:note_on(msg.note, msg.vel or 100, msg.ch or 1)
@@ -526,9 +538,9 @@ function send_midi(msg)
   end
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- TRANSFORM PIPELINE (with chaining)
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 -- Process through chain in order, applying probability per slot
 local function process_chain(original_msg)
@@ -580,9 +592,9 @@ local function process_chain(original_msg)
   midi_activity_time = util.time()
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- MIDI IN
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local function connect_midi()
   midi_in  = midi.connect(state.midi_in_port)
@@ -595,9 +607,9 @@ local function connect_midi()
   end
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- GRID
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local function grid_redraw()
   if not g then return end
@@ -770,9 +782,9 @@ local function grid_key(x, y, z)
   redraw()
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- NORNS SCREEN (REDESIGNED)
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local CURVE_NAMES = {"log","linear","exp"}
 local STRIP_NAMES = {"lowest","highest","last"}
@@ -877,9 +889,9 @@ function redraw()
     screen.move(0, 62)
     screen.text("K1: exit chain mode")
   else
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     -- STATUS STRIP (y 0-8)
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     screen.level(4)
     screen.move(0, 8)
     screen.text("FILTR")
@@ -902,9 +914,9 @@ function redraw()
     screen.move(124, 6)
     screen.text(".")
     
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     -- LIVE ZONE (y 9-52): Transform chain pipeline
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     
     screen.level(8)
     screen.move(0, 18)
@@ -955,9 +967,9 @@ function redraw()
       end
     end
     
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     -- SELECTED TRANSFORM PARAMETERS
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     
     local tr = transforms[state.selected_transform]
     if tr then
@@ -986,9 +998,9 @@ function redraw()
       end
     end
     
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     -- MIDI ACTIVITY INDICATOR
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     if midi_active then
       screen.level(12)
     else
@@ -997,9 +1009,9 @@ function redraw()
     screen.move(113, 28)
     screen.text("●")
     
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     -- CONTEXT BAR (y 53-58)
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     
     screen.level(5)
     screen.move(0, 62)
@@ -1010,9 +1022,9 @@ function redraw()
       midi_active and "ACTIVE" or "-"
     ))
     
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     -- POPUP (enc() triggered, 0.8s duration)
-    -- ════════════════════════════════════════════════════════════
+    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
     
     if popup_param and (now - popup_time) < 0.8 then
       screen.level(15)
@@ -1031,9 +1043,9 @@ function redraw()
   screen.update()
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- ENCODERS & KEYS
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 function enc(n, d)
   if chain_mode then
@@ -1129,9 +1141,9 @@ function key(n, z)
   redraw()
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- PRESET SAVE/LOAD
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local function ensure_preset_dir()
   local dir = _path.data .. "filtr/"
@@ -1171,9 +1183,9 @@ local function load_preset()
   popup_time = util.time()
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- PARAMS (norns params system for MIDI ports)
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 local function setup_params()
   params:add_separator("filtr")
@@ -1224,9 +1236,9 @@ local function setup_params()
   end
 end
 
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 -- INIT
--- ──────────────────────────────────────────────
+-- ────────────────────────────────────────
 
 function init()
   math.randomseed(os.time())
@@ -1264,4 +1276,5 @@ function cleanup()
       midi_out:cc(120, 0, ch)
     end
   end
+  engine.noteOffAll()
 end
