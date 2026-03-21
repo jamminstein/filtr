@@ -556,8 +556,10 @@ local function process_chain(original_msg)
             local mc = {}
             for k,v in pairs(m) do mc[k]=v end
             local results = t.process(mc, t.params, t)
-            for _, r in ipairs(results) do
-              table.insert(next_msgs, r)
+            if results then
+              for _, r in ipairs(results) do
+                table.insert(next_msgs, r)
+              end
             end
           end
           msgs = next_msgs
