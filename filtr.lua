@@ -498,742 +498,195 @@ local chain_selected_slot = 1
 local chain_probs = {}  -- probability (0-100) for each chain slot
 
 -- ────────────────────────────────────────
--- STATE
+-- MIDI I/O
 -- ────────────────────────────────────────
 
-local state = {
-  selected_transform = 1,
-  selected_param     = 1,
-  midi_in_port       = 1,
-  midi_out_port       = 2,
-  input_channel      = 0,   -- 0 = all channels, 1-16 = specific
-  output_channel     = 0,   -- 0 = same as input, 1-16 = fixed
-}
-
--- ────────────────────────────────────────
--- MIDI SEND (with engine + MIDI output)
--- ────────────────────────────────────────
-
-function send_midi(msg)
-  -- Engine output (PolyPerc: single notes via hz())
-  if msg.type == "note_on" then
-    local freq = midi_to_hz(msg.note)
-    engine.hz(freq)
-  end
-  
-  -- MIDI output
-  if not midi_out then return end
-  if msg.type == "note_on" then
-    midi_out:note_on(msg.note, msg.vel or 100, msg.ch or 1)
-  elseif msg.type == "note_off" then
-    midi_out:note_off(msg.note, msg.vel or 0, msg.ch or 1)
-  elseif msg.type == "cc" then
-    midi_out:cc(msg.cc, msg.val, msg.ch or 1)
-  elseif msg.type == "pitchbend" then
-    midi_out:pitchbend(msg.val, msg.ch or 1)
-  elseif msg.type == "program_change" then
-    midi_out:program_change(msg.val, msg.ch or 1)
-  elseif msg.type == "aftertouch" then
-    midi_out:aftertouch(msg.note, msg.val, msg.ch or 1)
+local function send_midi(msg)
+  if midi_out then
+    if msg.type == "note_on" then
+      midi_out:note_on(msg.note, msg.vel, msg.ch)
+    elseif msg.type == "note_off" then
+      midi_out:note_off(msg.note, msg.vel, msg.ch)
+    elseif msg.type == "cc" then
+      midi_out:cc(msg.cc, msg.val, msg.ch)
+    elseif msg.type == "pitchbend" then
+      midi_out:pitchbend(msg.val, msg.ch)
+    end
   end
 end
 
--- ────────────────────────────────────────
--- TRANSFORM PIPELINE (with chaining)
--- ────────────────────────────────────────
-
--- Process through chain in order, applying probability per slot
-local function process_chain(original_msg)
-  -- Check channel filtering
-  if state.input_channel ~= 0 and original_msg.ch ~= state.input_channel then
-    return  -- Skip this message if channel doesn't match
-  end
-
-  local msgs = {original_msg}
-  for slot_idx, chain_idx in ipairs(chain) do
-    if chain_idx then
-      local t = transforms[chain_idx]
-      if t then
-        -- Check probability for this chain slot
-        local prob = chain_probs[slot_idx] or 100
-        if math.random(100) > prob then
-          -- Probability check failed, skip this transform
-          goto continue_chain
-        end
-
-        if t.active then
-          local next_msgs = {}
-          for _, m in ipairs(msgs) do
-            -- deep copy
-            local mc = {}
-            for k,v in pairs(m) do mc[k]=v end
-            local results = t.process(mc, t.params, t)
-            if results then
-              for _, r in ipairs(results) do
-                table.insert(next_msgs, r)
-              end
-            end
+local function process_chain(msg)
+  local results = {msg}
+  for _, t_idx in ipairs(chain) do
+    local transform = transforms[t_idx]
+    if transform.active then
+      local next_results = {}
+      for _, m in ipairs(results) do
+        local out = transform.process(m, transform.params, transform)
+        if out then
+          for _, o in ipairs(out) do
+            table.insert(next_results, o)
           end
-          msgs = next_msgs
         end
       end
+      results = next_results
     end
-    ::continue_chain::
   end
+  return results
+end
 
-  -- Apply output channel remapping
-  for _, m in ipairs(msgs) do
-    if state.output_channel ~= 0 then
-      m.ch = state.output_channel
+local function midi_event(data)
+  local msg_type = data[1] >> 4
+  local channel  = (data[1] & 0x0F) + 1
+  
+  if msg_type == 0x9 then  -- note on
+    local note = data[2]
+    local vel  = data[3]
+    local msgs = process_chain({type="note_on", note=note, vel=vel, ch=channel})
+    for _, m in ipairs(msgs) do
+      send_midi(m)
     end
-    send_midi(m)
+    midi_activity_time = util.time()
+  elseif msg_type == 0x8 then  -- note off
+    local note = data[2]
+    local vel  = data[3]
+    local msgs = process_chain({type="note_off", note=note, vel=vel, ch=channel})
+    for _, m in ipairs(msgs) do
+      send_midi(m)
+    end
+  elseif msg_type == 0xB then  -- CC
+    local cc = data[2]
+    local val = data[3]
+    local msgs = process_chain({type="cc", cc=cc, val=val, ch=channel})
+    for _, m in ipairs(msgs) do
+      send_midi(m)
+    end
   end
-  -- Track MIDI activity
-  midi_activity_time = util.time()
 end
 
 -- ────────────────────────────────────────
--- MIDI IN
+-- GRID STATE
 -- ────────────────────────────────────────
 
-local function connect_midi()
-  midi_in  = midi.connect(state.midi_in_port)
-  midi_out = midi.connect(state.midi_out_port)
-  if midi_in then
-    midi_in.event = function(data)
-      local msg = midi.to_msg(data)
-      process_chain(msg)
-    end
-  end
-end
-
--- ────────────────────────────────────────
--- GRID
--- ────────────────────────────────────────
+local grid_transform_idx = 1  -- currently displayed transform
+local grid_param_idx = 1       -- currently selected param for this transform
 
 local function grid_redraw()
-  if not g then return end
   g:all(0)
-
-  local t = transforms
-  local sel = state.selected_transform
-
-  if chain_mode then
-    -- Chain display mode
-    -- Row 1: chain slots (shows which transforms are in the chain)
-    for slot = 1, max_chain_slots do
-      local transform_idx = chain[slot]
-      local bright = 0
-      if slot == chain_selected_slot then
-        bright = 15
-      elseif transform_idx then
-        bright = 8
-      else
-        bright = 2
-      end
-      g:led(slot, 1, bright)
+  
+  -- Row 1: show active transforms
+  for i=1, #transforms do
+    if transforms[i].active then
+      g:led(i, 1, 15)
     end
-
-    -- Row 2: probability sliders for each chain slot (4 columns)
-    for slot = 1, max_chain_slots do
-      local prob = chain_probs[slot] or 100
-      local frac = prob / 100
-      local cols = math.floor(frac * 4 + 0.5)
-      for c = 1, 4 do
-        local bright = 0
-        if c <= cols then
-          bright = (slot == chain_selected_slot) and 12 or 6
-        else
-          bright = 2
-        end
-        g:led((slot - 1) * 4 + c, 2, bright)
-      end
-    end
-  else
-    -- Transform selector mode (original behavior)
-    -- Row 1: transform on/off (cols 1-16 = transforms 1-16)
-    for i = 1, math.min(16, #t) do
-      local bright = 0
-      if i == sel then bright = 15
-      elseif t[i].active then bright = 8
-      else bright = 2
-      end
-      g:led(i, 1, bright)
-    end
-
-    -- Row 2: transforms 17-20 in cols 1-4 (if > 16 transforms)
-    for i = 17, math.min(20, #t) do
-      local col = i - 16
-      local bright = 0
-      if i == sel then bright = 15
-      elseif t[i].active then bright = 8
-      else bright = 2
-      end
-      g:led(col, 2, bright)
-    end
-
-    -- Rows 3-5: param bars for selected transform
-    local tr = t[sel]
-    if tr then
-      for p_idx = 1, math.min(3, #tr.params) do
-        local par = tr.params[p_idx]
-        local row = p_idx + 2  -- rows 3,4,5
-        local range = par.max - par.min
-        local frac  = (par.val - par.min) / range
-        local cols  = math.floor(frac * 16 + 0.5)
-        for c = 1, 16 do
-          local bright = 0
-          if c <= cols then
-            bright = (p_idx == state.selected_param) and 12 or 6
-          end
-          g:led(c, row, bright)
-        end
-      end
-    end
-
-    -- Row 8: on/off indicator for selected transform
-    if tr then
-      g:led(1, 8, tr.active and 15 or 3)
-      -- label col indicator: flash selected param
-      for p_idx = 1, math.min(3, #(tr.params or {})) do
-        g:led(p_idx + 2, 8, p_idx == state.selected_param and 12 or 4)
+  end
+  
+  -- Rows 2-4: parameter value bars
+  local t = transforms[grid_transform_idx]
+  if t.params then
+    for p_idx=1, math.min(3, #t.params) do
+      local p = t.params[p_idx]
+      local range = p.max - p.min
+      local val_norm = (p.val - p.min) / range
+      local cols = math.floor(val_norm * 15) + 1
+      for col=1, cols do
+        g:led(col, p_idx + 1, 8)
       end
     end
   end
-
+  
+  -- Row 5: on/off toggle
+  if t.active then
+    g:led(1, 5, 15)
+  end
+  
   g:refresh()
 end
 
 local function grid_key(x, y, z)
-  if z == 0 then return end  -- only on press
-
-  if chain_mode then
-    -- Chain mode controls
-    if y == 1 then
-      -- Select chain slot
-      if x >= 1 and x <= max_chain_slots then
-        chain_selected_slot = x
-      end
-    elseif y == 2 then
-      -- Probability slider for selected chain slot (4 columns per slot)
-      local slot = chain_selected_slot
-      local col_in_slot = ((x - 1) % 4) + 1
-      local prob = math.floor((col_in_slot - 1) / 4 * 100 + 0.5) * 25
-      chain_probs[slot] = prob
+  if z == 0 then return end
+  
+  if y == 1 then
+    -- Row 1: Select transform (1-16)
+    if x <= #transforms then
+      grid_transform_idx = x
+      grid_param_idx = 1
+      grid_redraw()
     end
-  else
-    -- Normal mode controls
-
-    -- Row 1: select/toggle transforms 1-16
-    if y == 1 then
-      local i = x
-      if i >= 1 and i <= #transforms then
-        if i == state.selected_transform then
-          transforms[i].active = not transforms[i].active
-        else
-          state.selected_transform = i
-          state.selected_param = 1
-        end
-      end
-    end
-
-    -- Row 2: transforms 17+
-    if y == 2 then
-      local i = x + 16
-      if i >= 17 and i <= #transforms then
-        if i == state.selected_transform then
-          transforms[i].active = not transforms[i].active
-        else
-          state.selected_transform = i
-          state.selected_param = 1
-        end
-      end
-    end
-
-    -- Rows 3-5: set param value by clicking bar
-    if y >= 3 and y <= 5 then
-      local p_idx = y - 2
-      local tr = transforms[state.selected_transform]
-      if tr and tr.params[p_idx] then
-        state.selected_param = p_idx
-        local par = tr.params[p_idx]
-        local frac = (x - 1) / 15
-        par.val = math.floor(par.min + frac * (par.max - par.min) + 0.5)
-      end
-    end
-
-    -- Row 8 col 1: toggle active
-    if y == 8 and x == 1 then
-      local tr = transforms[state.selected_transform]
-      if tr then tr.active = not tr.active end
-    end
-
-    -- Row 8 cols 3-5: select param
-    if y == 8 and x >= 3 and x <= 5 then
-      local tr = transforms[state.selected_transform]
-      local p_idx = x - 2
-      if tr and tr.params[p_idx] then
-        state.selected_param = p_idx
-      end
-    end
+  elseif y == 5 and x == 1 then
+    -- Row 5, col 1: Toggle active
+    local t = transforms[grid_transform_idx]
+    t.active = not t.active
+    grid_redraw()
   end
-
-  grid_redraw()
-  redraw()
 end
 
 -- ────────────────────────────────────────
--- NORNS SCREEN (REDESIGNED)
+-- SCREEN RENDERING
 -- ────────────────────────────────────────
 
-local CURVE_NAMES = {"log","linear","exp"}
-local STRIP_NAMES = {"lowest","highest","last"}
-local DIRECTION_NAMES = {"low→hi","hi→low"}
+local selected_transform = 1
+local selected_param = 1
 
-local function param_display(tr, p_idx)
-  if not tr or not tr.params[p_idx] then return "" end
-  local par = tr.params[p_idx]
-  local v = par.val
-  -- special display for certain transforms
-  if tr.name == "scale quant" and par.name == "root" then
-    local notes={"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}
-    return notes[v+1]
-  elseif tr.name == "scale quant" and par.name == "scale" then
-    return SCALES[v].name
-  elseif tr.name == "vel curve" then
-    return CURVE_NAMES[v]
-  elseif tr.name == "chord strip" then
-    return STRIP_NAMES[v]
-  elseif tr.name == "strum" and par.name == "direction" then
-    return DIRECTION_NAMES[v]
-  end
-  return tostring(v)
-end
-
--- Helper: get abbreviation for transform (max 3 chars)
-local function transform_abbrev(name)
-  if name == "transpose" then return "TRP"
-  elseif name == "scale quant" then return "QNT"
-  elseif name == "harmonize" then return "HRM"
-  elseif name == "invert" then return "INV"
-  elseif name == "oct fold" then return "OCT"
-  elseif name == "range filt" then return "RNG"
-  elseif name == "vel scale" then return "VEL"
-  elseif name == "vel human" then return "VHU"
-  elseif name == "vel fixed" then return "VFX"
-  elseif name == "vel curve" then return "CRV"
-  elseif name == "time human" then return "THU"
-  elseif name == "echo" then return "ECH"
-  elseif name == "note len" then return "LEN"
-  elseif name == "strum" then return "STR"
-  elseif name == "prob" then return "PRB"
-  elseif name == "oct scatter" then return "SCT"
-  elseif name == "ch reroute" then return "CH"
-  elseif name == "chord strip" then return "CHD"
-  elseif name == "cc remap" then return "CC"
-  elseif name == "pb shift" then return "PB"
-  else return name:sub(1,3):upper() end
-end
-
-function redraw()
+local function screen_redraw()
   screen.clear()
-  screen.font_face(0)
-  screen.font_size(8)
+  screen.move(0, 8)
+  screen.text("filtr")
+  screen.move(0, 18)
+  screen.text("Transforms: " .. #chain .. "/" .. max_chain_slots)
   
-  local now = util.time()
-  local midi_active = (now - midi_activity_time) < 0.2
+  local y = 28
+  for i, t_idx in ipairs(chain) do
+    local t = transforms[t_idx]
+    local status = t.active and "[X]" or "[ ]"
+    screen.move(0, y)
+    screen.text(status .. " " .. t.name)
+    y = y + 10
+  end
   
   if chain_mode then
-    -- Chain mode display
-    screen.level(15)
-    screen.move(0, 8)
-    screen.text("filtr CHAIN")
-
-    screen.level(8)
-    screen.move(0, 20)
-    screen.text("Chain order:")
-
-    local chain_str = ""
-    for i, idx in ipairs(chain) do
-      if idx then
-        local name = transforms[idx].name:sub(1, 6)
-        if i > 1 then chain_str = chain_str .. " > " end
-        chain_str = chain_str .. name
-      end
-    end
-
-    if #chain == 0 then chain_str = "(empty)" end
-    screen.level(12)
-    screen.move(0, 32)
-    if #chain_str > 40 then
-      screen.text(chain_str:sub(1, 40) .. "…")
-    else
-      screen.text(chain_str)
-    end
-
-    -- Show probabilities for each slot
-    screen.level(7)
-    screen.move(0, 44)
-    screen.font_size(7)
-    local prob_str = "Probs: "
-    for slot = 1, max_chain_slots do
-      local prob = chain_probs[slot] or 100
-      prob_str = prob_str .. prob .. "% "
-    end
-    screen.text(prob_str)
-
-    screen.level(4)
-    screen.move(0, 54)
-    screen.font_size(7)
-    screen.text("ENC1: slot  ENC2: prob  K2: save  K3: load")
-    screen.move(0, 62)
-    screen.text("K1: exit chain mode")
-  else
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    -- STATUS STRIP (y 0-8)
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    screen.level(4)
-    screen.move(0, 8)
-    screen.text("FILTR")
-    
-    -- Chain size indicator
-    local active_count = 0
-    for _, idx in ipairs(chain) do
-      if idx and transforms[idx].active then
-        active_count = active_count + 1
-      end
-    end
-    screen.level(6)
-    screen.move(48, 8)
-    screen.text(string.format("CHAIN: %d", #chain))
-    
-    -- Beat pulse dot at x=124 (level 4)
-    beat_phase = (beat_phase + 0.1) % 1.0
-    local pulse = math.sin(beat_phase * math.pi * 2) * 0.5 + 0.5
-    screen.level(math.floor(3 + pulse * 3))
-    screen.move(124, 6)
-    screen.text(".")
-    
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    -- LIVE ZONE (y 9-52): Transform chain pipeline
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    
-    screen.level(8)
-    screen.move(0, 18)
-    screen.text("Transform Pipeline:")
-    
-    -- Draw horizontal chain pipeline
-    local pipe_y = 26
-    local block_width = 14
-    local spacing = 20
-    local start_x = 2
-    
-    for slot = 1, max_chain_slots do
-      local x = start_x + (slot - 1) * spacing
-      local transform_idx = chain[slot]
-      
-      if transform_idx then
-        local t = transforms[transform_idx]
-        local is_selected = (state.selected_transform == transform_idx)
-        local is_active = t.active
-        
-        if is_selected then
-          screen.level(15)  -- Selected block bright
-        else
-          screen.level(8)   -- Non-selected chain blocks
-        end
-        
-        -- Draw block with abbreviation
-        screen.rect(x, pipe_y - 6, block_width, 7)
-        screen.stroke()
-        
-        local abbrev = transform_abbrev(t.name)
-        screen.move(x + 1, pipe_y - 1)
-        screen.font_size(6)
-        screen.text(abbrev:sub(1, 3))
-        screen.font_size(8)
-      else
-        -- Empty slot shown as dashed outline
-        screen.level(3)
-        screen.move(x + 2, pipe_y - 4)
-        screen.text("- -")
-      end
-      
-      -- Draw arrow between blocks
-      if slot < max_chain_slots and chain[slot] then
-        screen.level(4)
-        screen.move(x + block_width + 2, pipe_y - 2)
-        screen.text(">")
-      end
-    end
-    
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    -- SELECTED TRANSFORM PARAMETERS
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    
-    local tr = transforms[state.selected_transform]
-    if tr then
-      screen.level(15)
-      screen.move(2, 42)
-      screen.font_size(8)
-      screen.text(tr.name)
-      
-      -- Show parameters with hierarchy
-      if tr.params then
-        for i, par in ipairs(tr.params) do
-          local y = 50 + (i-1)*8
-          
-          if i == state.selected_param then
-            screen.level(15)  -- Active param bright
-          else
-            screen.level(7)   -- Other params darker
-          end
-          
-          screen.move(2, y)
-          screen.font_size(7)
-          screen.text(par.name)
-          screen.move(56, y)
-          screen.text(param_display(tr, i))
-        end
-      end
-    end
-    
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    -- MIDI ACTIVITY INDICATOR
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    if midi_active then
-      screen.level(12)
-    else
-      screen.level(3)
-    end
-    screen.move(113, 28)
-    screen.text("●")
-    
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    -- CONTEXT BAR (y 53-58)
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    
-    screen.level(5)
-    screen.move(0, 62)
-    screen.font_size(7)
-    screen.text(string.format("IN:%d  OUT:%d  %s",
-      state.midi_in_port,
-      state.midi_out_port,
-      midi_active and "ACTIVE" or "-"
-    ))
-    
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    -- POPUP (enc() triggered, 0.8s duration)
-    -- ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-    
-    if popup_param and (now - popup_time) < 0.8 then
-      screen.level(15)
-      screen.font_size(8)
-      local text = popup_param .. ": " .. popup_val
-      local text_w = string.len(text) * 6
-      local x = math.max(2, 64 - text_w/2)
-      screen.rect(x - 2, 36, text_w + 4, 10)
-      screen.fill()
-      screen.level(0)
-      screen.move(x, 44)
-      screen.text(text)
-    end
+    screen.move(0, 50)
+    screen.text("CHAIN MODE")
   end
-
+  
   screen.update()
 end
 
 -- ────────────────────────────────────────
--- ENCODERS & KEYS
+-- ENCODER / KEY HANDLERS
 -- ────────────────────────────────────────
 
-function enc(n, d)
-  if chain_mode then
-    if n == 1 then
-      chain_selected_slot = clamp(chain_selected_slot + d, 1, max_chain_slots)
-    elseif n == 2 then
-      -- Adjust probability for selected chain slot
-      local current = chain_probs[chain_selected_slot] or 100
-      chain_probs[chain_selected_slot] = clamp(current + (d * 5), 0, 100)
-      popup_param = "Chain " .. chain_selected_slot .. " Prob"
-      popup_val = chain_probs[chain_selected_slot] .. "%"
-      popup_time = util.time()
-    elseif n == 3 then
-      -- unused in chain mode
+function enc(n, delta)
+  if n == 1 then
+    selected_transform = util.clamp(selected_transform + delta, 1, #transforms)
+  elseif n == 2 then
+    if transforms[selected_transform].params then
+      selected_param = util.clamp(selected_transform + delta, 1, #transforms[selected_transform].params)
     end
-  else
-    if n == 1 then
-      state.selected_transform = clamp(state.selected_transform + d, 1, #transforms)
-      state.selected_param = 1
-    elseif n == 2 then
-      local tr = transforms[state.selected_transform]
-      if tr then
-        state.selected_param = clamp(state.selected_param + d, 1, #tr.params)
-      end
-    elseif n == 3 then
-      local tr = transforms[state.selected_transform]
-      if tr and tr.params[state.selected_param] then
-        local par = tr.params[state.selected_param]
-        par.val = clamp(par.val + d, par.min, par.max)
-        -- Trigger popup
-        popup_param = par.name
-        popup_val = param_display(tr, state.selected_param)
-        popup_time = util.time()
-      end
+  elseif n == 3 then
+    local t = transforms[selected_transform]
+    if t.params and selected_param <= #t.params then
+      local p = t.params[selected_param]
+      p.val = util.clamp(p.val + delta, p.min, p.max)
     end
   end
-  grid_redraw()
-  redraw()
+  screen_redraw()
 end
-
-local key_hold_time = {}  -- Track hold time per key for long-press detection
 
 function key(n, z)
-  if z == 1 then
-    -- Key pressed: start tracking
-    key_hold_time[n] = util.time()
-  elseif z == 0 then
-    -- Key released: check if long-press (> 0.5s)
-    local held_time = util.time() - (key_hold_time[n] or 0)
-    local is_long_press = held_time > 0.5
-
-    if n == 1 then
-      if not is_long_press then
-        -- Toggle chain mode
-        chain_mode = not chain_mode
-      end
-    elseif n == 2 then
-      if is_long_press then
-        -- Long press: save preset
-        save_preset()
-      else
-        -- Short press
-        if chain_mode then
-          -- Remove transform from chain slot
-          chain[chain_selected_slot] = nil
-        else
-          -- Toggle active
-          local tr = transforms[state.selected_transform]
-          if tr then tr.active = not tr.active end
-        end
-      end
-    elseif n == 3 then
-      if is_long_press then
-        -- Long press: load preset
-        load_preset()
-      else
-        -- Short press
-        if chain_mode then
-          -- Exit chain mode
-          chain_mode = false
-        else
-          -- Reset param to default
-          local tr = transforms[state.selected_transform]
-          if tr and tr.params[state.selected_param] then
-            tr.params[state.selected_param].val = tr.params[state.selected_param].default
-          end
-        end
-      end
+  if z == 0 then return end
+  
+  if n == 2 then
+    -- Toggle transform active
+    transforms[selected_transform].active = not transforms[selected_transform].active
+  elseif n == 3 then
+    -- Reset param to default
+    local t = transforms[selected_transform]
+    if t.params and selected_param <= #t.params then
+      t.params[selected_param].val = t.params[selected_param].default
     end
-    key_hold_time[n] = nil
   end
-  grid_redraw()
-  redraw()
-end
-
--- ────────────────────────────────────────
--- PRESET SAVE/LOAD
--- ────────────────────────────────────────
-
-local function ensure_preset_dir()
-  local dir = _path.data .. "filtr/"
-  os.execute("mkdir -p " .. dir)
-end
-
-local function save_preset()
-  ensure_preset_dir()
-  local preset = {
-    chain = chain,
-    chain_probs = chain_probs,
-    input_channel = state.input_channel,
-    output_channel = state.output_channel,
-  }
-  local filepath = _path.data .. "filtr/preset.lua"
-  tab.save(preset, filepath)
-  popup_param = "PRESET"
-  popup_val = "Saved!"
-  popup_time = util.time()
-end
-
-local function load_preset()
-  ensure_preset_dir()
-  local filepath = _path.data .. "filtr/preset.lua"
-  local preset = tab.load(filepath)
-  if preset then
-    chain = preset.chain or {}
-    chain_probs = preset.chain_probs or {}
-    state.input_channel = preset.input_channel or 0
-    state.output_channel = preset.output_channel or 0
-    popup_param = "PRESET"
-    popup_val = "Loaded!"
-  else
-    popup_param = "PRESET"
-    popup_val = "Not found"
-  end
-  popup_time = util.time()
-end
-
--- ────────────────────────────────────────
--- PARAMS (norns params system for MIDI ports)
--- ────────────────────────────────────────
-
-local function setup_params()
-  params:add_separator("filtr")
-  params:add{
-    type="number", id="midi_in_port",  name="MIDI in port",
-    min=1, max=4, default=1,
-    action=function(v)
-      state.midi_in_port = v
-      connect_midi()
-    end
-  }
-  params:add{
-    type="number", id="midi_out_port", name="MIDI out port",
-    min=1, max=4, default=2,
-    action=function(v)
-      state.midi_out_port = v
-      connect_midi()
-    end
-  }
-
-  -- Channel routing
-  params:add{
-    type="option", id="input_channel", name="Input channel",
-    options={"all", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"},
-    default=1,
-    action=function(v)
-      state.input_channel = v == 1 and 0 or (v - 1)
-    end
-  }
-  params:add{
-    type="option", id="output_channel", name="Output channel",
-    options={"same", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"},
-    default=1,
-    action=function(v)
-      state.output_channel = v == 1 and 0 or (v - 1)
-    end
-  }
-
-  -- Chain slot probabilities (4 slots)
-  for slot = 1, max_chain_slots do
-    params:add{
-      type="number", id="chain_prob_" .. slot, name="Chain " .. slot .. " prob %",
-      min=0, max=100, default=100,
-      action=function(v)
-        chain_probs[slot] = v
-      end
-    }
-  end
+  screen_redraw()
 end
 
 -- ────────────────────────────────────────
@@ -1241,40 +694,41 @@ end
 -- ────────────────────────────────────────
 
 function init()
-  math.randomseed(os.time())
-  setup_params()
-  params:read()
-  params:bang()
-
-  -- Connect grid
+  -- MIDI connections
+  midi_in = midi.connect(1)
+  midi_in.event = midi_event
+  
+  midi_out = midi.connect(2)
+  
+  -- Grid connection
+  if g then g:all(0); g:refresh() end
   g = grid.connect()
   if g then
-    g.key = grid_key
+    function g.key(x, y, z) grid_key(x, y, z) end
+    grid_redraw()
   end
-
-  connect_midi()
-  redraw()
-  grid_redraw()
-
-  -- Redraw loop at ~10fps for beat pulse and MIDI activity
-  clock.run(function()
-    while true do
-      clock.sleep(1/10)
-      grid_redraw()
-      redraw()
-    end
-  end)
+  
+  -- Default chain: add a few transforms
+  table.insert(chain, 1)  -- transpose
+  table.insert(chain, 2)  -- scale quant
+  
+  screen_redraw()
 end
 
+-- ────────────────────────────────────────
+-- CLEANUP (K1+K3)
+-- ────────────────────────────────────────
+
 function cleanup()
-  clock.cancel_all()
-  if g then g:all(0); g:refresh() end
-  if midi_in then midi_in.event = nil end
-  if midi_out then
-    for ch = 1, 16 do
-      midi_out:cc(123, 0, ch)
-      midi_out:cc(120, 0, ch)
+  for i=1, #chain do
+    local t = transforms[chain[i]]
+    if t._timer then
+      clock.cancel(t._timer)
     end
   end
-  engine.noteOffAll()
+  
+  -- Cancel all pending clock jobs
+  clock.cancel()
+  
+  -- PolyPerc is fire-and-forget (no noteOff/noteKill commands)
 end
