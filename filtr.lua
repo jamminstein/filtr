@@ -762,9 +762,6 @@ function cleanup()
     end
   end
 
-  -- Cancel all pending clock jobs
-  clock.cancel()
-
   -- PolyPerc is fire-and-forget (no noteOff/noteKill commands)
-  if opxy_out then opxy_out:cc(123, 0, params:get("opxy_channel")) end
+  if opxy_out then for ch=1,16 do opxy_out:cc(123,0,ch) end end
 end
