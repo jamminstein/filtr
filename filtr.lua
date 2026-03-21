@@ -483,8 +483,8 @@ local transforms = {
         -- send pitch bend before note
         local pb = math.floor((p[1].val / 12) * 8191 + 8192)
         pb = clamp(pb, 0, 16383)
-        local lsb = pb & 0x7F
-        local msb = (pb >> 7) & 0x7F
+        local lsb = bit32.band(pb, 0x7F)
+        local msb = bit32.band(bit32.rshift(pb, 7), 0x7F)
         return {
           {type="pitchbend", val=pb, ch=msg.ch},
           msg
@@ -558,8 +558,8 @@ local function process_chain(msg)
 end
 
 local function midi_event(data)
-  local msg_type = data[1] >> 4
-  local channel  = (data[1] & 0x0F) + 1
+  local msg_type = bit32.rshift(data[1], 4)
+  local channel  = bit32.band(data[1], 0x0F) + 1
   
   if msg_type == 0x9 then  -- note on
     local note = data[2]
