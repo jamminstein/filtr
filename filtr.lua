@@ -29,6 +29,15 @@ local midi_in  = nil
 local midi_out = nil
 local g        = nil  -- grid
 
+-- ── OP-XY MIDI output ──
+local opxy_out = nil
+local function opxy_note_on(note, vel)
+  if opxy_out then opxy_out:note_on(note, vel, params:get("opxy_channel")) end
+end
+local function opxy_note_off(note)
+  if opxy_out then opxy_out:note_off(note, 0, params:get("opxy_channel")) end
+end
+
 local function midi_to_hz(note)
   return 440 * 2^((note - 69) / 12)
 end
@@ -513,6 +522,19 @@ local function send_midi(msg)
       midi_out:pitchbend(msg.val, msg.ch)
     end
   end
+  -- OP-XY mirror: forward transformed MIDI to OP-XY
+  if opxy_out then
+    local ch = params:get("opxy_channel")
+    if msg.type == "note_on" then
+      opxy_out:note_on(msg.note, msg.vel, ch)
+    elseif msg.type == "note_off" then
+      opxy_out:note_off(msg.note, msg.vel, ch)
+    elseif msg.type == "cc" then
+      opxy_out:cc(msg.cc, msg.val, ch)
+    elseif msg.type == "pitchbend" then
+      opxy_out:pitchbend(msg.val, ch)
+    end
+  end
 end
 
 local function process_chain(msg)
@@ -697,8 +719,17 @@ function init()
   -- MIDI connections
   midi_in = midi.connect(1)
   midi_in.event = midi_event
-  
+
   midi_out = midi.connect(2)
+
+  -- OP-XY params
+  params:add_separator("OP-XY")
+  params:add_number("opxy_device","OP-XY MIDI Device",1,4,3)
+  params:set_action("opxy_device",function(v)
+    opxy_out=midi.connect(v)
+  end)
+  params:add_number("opxy_channel","OP-XY MIDI Channel",1,16,1)
+  opxy_out=midi.connect(params:get("opxy_device"))
   
   -- Grid connection
   if g then g:all(0); g:refresh() end
@@ -730,9 +761,10 @@ function cleanup()
       clock.cancel(t._timer)
     end
   end
-  
+
   -- Cancel all pending clock jobs
   clock.cancel()
-  
+
   -- PolyPerc is fire-and-forget (no noteOff/noteKill commands)
+  if opxy_out then opxy_out:cc(123, 0, params:get("opxy_channel")) end
 end
